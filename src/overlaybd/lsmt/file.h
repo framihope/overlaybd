@@ -26,6 +26,7 @@ IMemoryIndex -> IMemoryIndex0 -> IComboIndex -> Index0 ( set<SegmentMap> ) -> Co
 #include <inttypes.h>
 #include <cstddef>
 #include <vector>
+#include <string>
 #include <photon/fs/filesystem.h>
 #include <photon/fs/virtual-file.h>
 #include <photon/common/uuid.h>
@@ -117,7 +118,12 @@ enum class RWType : uint8_t {
     Append,
     Hybrid,
     Sparse,
+    Unknown = (uint8_t)-1, // -1: not a valid layer type, only a parse result
 };
+
+// parse an RW layer type name ("append", "hybrid" or "sparse").
+// returns RWType::Unknown if `name` is unrecognized.
+RWType parse_rw_type(const std::string &name);
 
 // create a new writable LSMT file constitued by a data file and an index file,
 // optionally obtaining the ownerships of the underlying files,

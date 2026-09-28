@@ -17,6 +17,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <string>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 #include <vector>
@@ -381,6 +382,79 @@ ERROR_EXIT:
     return NULL;
 }
 
+static int create_fresh_upper(const std::string &data, const std::string &index,
+                              uint64_t vsize, LSMT::RWType rw_type) {
+    const auto flags = O_RDWR | O_CREAT | O_EXCL;
+    const auto mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
+    auto fdata = open_localfile_adaptor(data.c_str(), flags, mode, 0);
+    if (!fdata)
+        LOG_ERRNO_RETURN(0, -1, "open(`) failed", data);
+    DEFER(delete fdata);
+
+    bool index_created = false, complete = false;
+    DEFER({
+        if (!complete) {
+            if (index_created) ::unlink(index.c_str());
+            ::unlink(data.c_str());
+        }
+    });
+    auto findex = open_localfile_adaptor(index.c_str(), flags, mode, 0);
+    if (!findex)
+        LOG_ERRNO_RETURN(0, -1, "open(`) failed", index);
+    index_created = true;
+    DEFER(delete findex);
+    LSMT::LayerInfo args(fdata, findex);
+    args.virtual_size = vsize;
+    args.rw_type = rw_type;
+    auto file = LSMT::create_file_rw(args, false);
+    if (!file) {
+        LOG_ERROR_RETURN(0, -1, "LSMT::create_file_rw(`, `, rw_type=`) failed", data,
+                         index, (int)rw_type);
+    }
+    DEFER(delete file);
+    complete = true;
+    return 0;
+}
+
+// Returns -1 on error, 0 for an existing pair, 1 for a newly created pair.
+static int prepare_upper(ImageConfigNS::UpperConfig &upper, uint64_t inherited_vsize = 0) {
+    const auto data = upper.data();
+    const auto index = upper.index();
+    if (data.empty() || index.empty())
+        LOG_ERROR_RETURN(EINVAL, -1, "upper requires both data and index paths");
+    if (data == index)
+        LOG_ERROR_RETURN(EINVAL, -1, "upper data and index must use different paths");
+
+    const bool data_exists = (::access(data.c_str(), F_OK) == 0);
+    if (!data_exists && errno != ENOENT)
+        LOG_ERRNO_RETURN(0, -1, "access(`) failed", data);
+    const bool index_exists = (::access(index.c_str(), F_OK) == 0);
+    if (!index_exists && errno != ENOENT)
+        LOG_ERRNO_RETURN(0, -1, "access(`) failed", index);
+
+    if (data_exists != index_exists)
+        LOG_ERROR_RETURN(EINVAL, -1, "upper data and index must both exist or both be absent: data=`, index=`",
+                         data, index);
+
+    if (data_exists) {
+        LOG_INFO("opening existing upper: data=`, index=`", data, index);
+        return 0;
+    }
+    if (!upper.create())
+        LOG_ERROR_RETURN(ENOENT, -1, "upper requires existing data and index: data=`, index=`",
+                         data, index);
+
+    auto rw_type = LSMT::parse_rw_type(upper.rwType());
+    if (rw_type == LSMT::RWType::Unknown)
+        LOG_ERROR_RETURN(EINVAL, -1, "invalid upper rwType `, expected append/hybrid/sparse",
+                         upper.rwType());
+    const auto vsize = upper.vsize() ? upper.vsize() * 1024 * 1024 * 1024 : inherited_vsize;
+    if (create_fresh_upper(data, index, vsize, rw_type) != 0)
+        return -1;
+    LOG_INFO("created fresh upper (rwType: `): data=`, index=`", upper.rwType(), data, index);
+    return 1;
+}
+
 LSMT::IFileRW *ImageFile::open_upper(ImageConfigNS::UpperConfig &upper) {
     IFile *data_file = NULL;
     IFile *idx_file = NULL;
@@ -443,6 +517,7 @@ int ImageFile::init_image_file() {
     LSMT::IFileRW *upper_file = nullptr;
     LSMT::IFileRW *stack_ret = nullptr;
     ImageConfigNS::UpperConfig upper;
+    int upper_state = 0;
     bool record_no_download = false;
     bool has_error = false;
     auto lowers = conf.lowers(); // layer0 ... layerN-1
@@ -474,7 +549,6 @@ int ImageFile::init_image_file() {
         }
     }
 
-    upper.CopyFrom(conf.upper(), upper.GetAllocator());
     lower_file = open_lowers(lowers, has_error);
 
     if (has_error) {
@@ -483,12 +557,20 @@ int ImageFile::init_image_file() {
         goto ERROR_EXIT;
     }
 
-    // have only RO layers
-    if (upper.index() == "" || upper.data() == "") {
-        LOG_INFO("RW layer path not set. return RO layers.");
+    // An absent or empty upper preserves the read-only image configuration.
+    if (!conf.HasMember("upper") ||
+        (conf["upper"].IsObject() && conf["upper"].MemberCount() == 0)) {
+        LOG_INFO("upper not configured; using read-only lower layers");
         m_file = lower_file;
         read_only = true;
         goto SUCCESS_EXIT;
+    }
+
+    upper.CopyFrom(conf.upper(), upper.GetAllocator());
+    upper_state = prepare_upper(upper);
+    if (upper_state < 0) {
+        LOG_ERROR("failed to prepare upper layer");
+        goto ERROR_EXIT;
     }
 
     upper_file = open_upper(upper);
@@ -533,6 +615,10 @@ SUCCESS_EXIT:
 ERROR_EXIT:
     delete lower_file;
     delete upper_file;
+    if (upper_state > 0) {
+        ::unlink(upper.index().c_str());
+        ::unlink(upper.data().c_str());
+    }
     return -1;
 }
 
@@ -579,12 +665,34 @@ int ImageFile::create_snapshot(const char *new_config_path) {
     if(upper.index() == conf.upper().index() || upper.data() == conf.upper().data())
         LOG_ERROR_RETURN(0, -1, "The new upper layer(`, `) should be different from the old upper layer(`, `).", upper.data(), upper.index(), conf.upper().data(), conf.upper().index());
 
-    upper_file = open_upper(upper);
-    if (!upper_file)
-        LOG_ERROR_RETURN(0, -1, "Open upper layer failed.");
+    uint64_t inherited_vsize = 0;
+    if (upper.create() && upper.vsize() == 0) {
+        struct stat image_stat;
+        if (m_file->fstat(&image_stat) != 0)
+            LOG_ERRNO_RETURN(0, -1, "fstat current image failed");
+        inherited_vsize = image_stat.st_size;
+    }
+    int upper_state = prepare_upper(upper, inherited_vsize);
+    if (upper_state < 0)
+        LOG_ERROR_RETURN(0, -1, "Prepare new upper layer failed.");
 
-    if(((LSMT::IFileRW *)m_file)->restack(upper_file) != 0)
+    upper_file = open_upper(upper);
+    if (!upper_file) {
+        if (upper_state > 0) {
+            ::unlink(upper.index().c_str());
+            ::unlink(upper.data().c_str());
+        }
+        LOG_ERROR_RETURN(0, -1, "Open upper layer failed.");
+    }
+
+    if(((LSMT::IFileRW *)m_file)->restack(upper_file) != 0) {
+        delete upper_file;
+        if (upper_state > 0) {
+            ::unlink(upper.index().c_str());
+            ::unlink(upper.data().c_str());
+        }
         LOG_ERRNO_RETURN(0, -1, "Restack new rwlayer failed.");
+    }
 
     if(m_upper_file) {
         // transfer the sealed layer from m_upper_file to m_lower_file before m_upper_file is destructed

@@ -34,17 +34,6 @@
 using namespace std;
 using namespace photon::fs;
 
-IFile *open_file(const char *fn, int flags, mode_t mode = 0) {
-    auto file = open_localfile_adaptor(fn, flags, mode, 0);
-    if (!file) {
-        fprintf(stderr, "failed to open file '%s', %d: %s\n", fn, errno, strerror(errno));
-        exit(-1);
-    }
-    return file;
-}
-
-
-
 int main(int argc, char **argv) {
     uint64_t vsize;
     string parent_uuid;
@@ -85,8 +74,19 @@ int main(int argc, char **argv) {
     vsize *= 1024 * 1024 * 1024;
     const auto flag = O_RDWR | O_EXCL | O_CREAT;
     const auto mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
-    IFile* fdata = open_file(data_file_path.c_str(), flag, mode);
-    IFile* findex = open_file(index_file_path.c_str(), flag, mode);
+    IFile* fdata = open_localfile_adaptor(data_file_path.c_str(), flag, mode, 0);
+    if (!fdata) {
+        fprintf(stderr, "failed to open data file, %d: %s\n", errno, strerror(errno));
+        return -1;
+    }
+    IFile* findex = open_localfile_adaptor(index_file_path.c_str(), flag, mode, 0);
+    if (!findex) {
+        int error = errno;
+        delete fdata;
+        unlink(data_file_path.c_str());
+        fprintf(stderr, "failed to open index file, %d: %s\n", error, strerror(error));
+        return -1;
+    }
     IFile* file = nullptr;
 
     if (raw) {

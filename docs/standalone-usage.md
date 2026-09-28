@@ -153,7 +153,9 @@ The upper option in overlaybd config file must be set to use a writable layer. O
     "resultFile": "/home/overlaybd/1/result"
 }
 ```
-If upper is set, the overlaybd device is launched as a writable device. The differences produced by data writing are stored in the index and data files ofupper.
+If a nonempty upper is set, the overlaybd device is launched as a writable device. The differences produced by data writing are stored in the upper's index and data files.
+
+Both `upper.index` and `upper.data` are required for a nonempty `upper`. By default (`create: false`), both files must already exist. With `"create": true`, opening the image creates the pair when both files are absent (their parent directories must exist), or reuses the pair when both files already exist. If only one file exists, opening fails without changing it. `vsize` specifies the size in GiB (0 inherits the lower layer size), and `rwType` can be `append` (default), `hybrid`, or `sparse`. Omit `upper` or set it to `{}` for a read-only image.
 
 After writing data and destroying the device, `overlaybd-commit` command is required to excute to commit the layer into a read-only layer and can be used asa lower layer later.
 ```bash

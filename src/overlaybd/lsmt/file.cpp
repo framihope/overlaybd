@@ -230,6 +230,17 @@ static const char *rw_type_name(RWType type) {
     }
 }
 
+RWType parse_rw_type(const std::string &name) {
+    if (name == "append") {
+        return RWType::Append;
+    } else if (name == "hybrid") {
+        return RWType::Hybrid;
+    } else if (name == "sparse") {
+        return RWType::Sparse;
+    }
+    return RWType::Unknown;
+}
+
 static int write_header_trailer(IFile *file, bool is_header, bool is_sealed, bool is_data_file,
                                 uint64_t index_offset, uint64_t index_size, const LayerInfo &args) {
     ALIGNED_MEM(buf, HeaderTrailer::SPACE, ALIGNMENT4K);
